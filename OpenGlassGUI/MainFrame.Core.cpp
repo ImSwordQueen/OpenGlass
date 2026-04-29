@@ -1180,19 +1180,11 @@ namespace OpenGlass
 			}
 		});
 
-		auto updateGlow = [this, updateDword, deleteValue]() {
+		auto updateGlow = [this, updateDword]() {
 			int mode = m_chTextGlowMode->GetSelection();
-			int size = m_scTextGlowSize->GetValue();
-			DWORD val = (DWORD)mode | ((DWORD)size << 16);
-			if (val == 1)
-			{
-				deleteValue(L"TextGlowMode");
-				NotifySettingsChange(ChangeType::Theme);
-			}
-			else
-			{
-				updateDword(L"TextGlowMode", val, ChangeType::Theme);
-			}
+			int size = mode == 3 ? m_scTextGlowSize->GetValue() : 0;
+			DWORD val = static_cast<DWORD>(mode) | (static_cast<DWORD>(size) << 16);
+			updateDword(L"TextGlowMode", val, ChangeType::Theme);
 		};
 
 		m_chTextGlowMode->Bind(wxEVT_CHOICE, [this, updateGlow]([[maybe_unused]] wxCommandEvent& e) {
