@@ -118,355 +118,744 @@ namespace OpenGlass::CaptionTextHandler
 	winrt::com_ptr<ID2D1Bitmap1> g_textGlowD2DBitmap{};
 	winrt::com_ptr<ID2D1Effect> g_textGlowEffect{};
 	winrt::com_ptr<ID2D1Effect> g_textMorphologyEffect{};
-	winrt::com_ptr<ID2D1SolidColorBrush> g_textBackgroundBrush{};
 
 	COLORREF g_textGlowColor{};
 
 	int g_textGlowSize{};
-	constexpr int g_gdiplusTextPadding{ 2 };
 	int g_textGlowIntensity{};
 	bool g_centerCaption{ false };
+	bool g_captionSubpixelTextRenderer{ true };
 
-	void CalculateRealizedTextGlowParams(int textGlowMode);
-	COLORREF GetResolvedCaptionTextColor(const CWindowState& windowState, COLORREF fallbackColor)
-	{
-		const auto textColor = windowState.active ? (windowState.maximized ? g_captionActiveColorMaximized : g_captionActiveColor) : (windowState.maximized ? g_captionInactiveColorMaximized : g_captionInactiveColor);
-		return textColor != 0xFFFFFFFF ? textColor : fallbackColor;
-	}
-
-	D2D1_COLOR_F GetOpaqueCaptionBackgroundColor(const CWindowState& windowState)
-	{
-		auto backgroundColor = Color::scRGBTosRGB(
-			GlassKernel::RealizeWindowColorization(
-				GlassKernel::GetBaseColor(true, windowState.maximized),
-				GlassKernel::GetSourceColor(windowState.active),
-				GlassKernel::GetColorizationOpacity(windowState.active, windowState.maximized),
-				true,
-				false
-			).GetEffectivescRGBBlendColor(0.f),
-			0.f
-		);
-		backgroundColor.a = 1.f;
-
-		return backgroundColor;
-	}
-
-
+	bool MeasureGdiSubpixelText(
+		HDC hdc,
+		LPCWSTR text,
+		int textLength,
+		LPRECT rect,
+		UINT format
+	);
+	bool DrawGdiSubpixelText(
+		HDC hdc,
+		LPCWSTR text,
+		int textLength,
+		const RECT& drawRect,
+		UINT format,
+		COLORREF color
+	);
+	static constexpr int c_captionSubpixelScale = 6;
+	static constexpr int c_gdiTextPadding = 2;
 	int GetLegacyTextSurfacePadding()
 	{
-		return g_textGlowSize + g_gdiplusTextPadding;
+		return g_textGlowSize + c_gdiTextPadding;
 	}
-
-	D2D1_RECT_F GetTextBoundingBox(const D2D1_POINT_2F& origin, IDWriteTextLayout* textLayout, const DWRITE_TEXT_METRICS& metrics)
+	class CaptionSubpixelTextRenderer final : public IDWriteTextRenderer
 	{
+		static constexpr int c_subpixelScale = c_captionSubpixelScale;
+
+		ULONG m_refCount{ 1 };
+		IDWriteFactory* m_factory{};
+		D2D1_COLOR_F m_color{};
+		std::vector<BYTE>& m_pixels;
+		UINT32 m_width{};
+		UINT32 m_height{};
+		int m_bitmapLeft{};
+		int m_bitmapTop{};
+		float m_pixelsPerDip{ 1.f };
+		bool m_hasPixels{ false };
+
+		static BYTE AverageCoverage(const std::vector<BYTE>& mask, UINT32 maskWidth, UINT32 maskHeight, int x, int y, const RECT& bounds, int firstSample)
+		{
+			UINT32 coverage{};
+			UINT32 sampleCount{};
+
+			for (int sample = 0; sample < 2; sample++)
+			{
+				const int sourceX = x * c_subpixelScale + firstSample + sample - bounds.left;
+				const int sourceY = y - bounds.top;
+				if (sourceX >= 0 && sourceY >= 0 && sourceX < static_cast<int>(maskWidth) && sourceY < static_cast<int>(maskHeight))
+				{
+					coverage += mask[static_cast<size_t>(sourceY) * maskWidth + sourceX];
+					sampleCount++;
+				}
+			}
+
+			return sampleCount ? static_cast<BYTE>(coverage / sampleCount) : 0;
+		}
+
+		void BlendPixel(UINT32 x, UINT32 y, BYTE coverageR, BYTE coverageG, BYTE coverageB)
+		{
+			const BYTE coverageA = std::max({ coverageR, coverageG, coverageB });
+			if (!coverageA)
+			{
+				return;
+			}
+
+			const auto colorA = static_cast<UINT32>(std::round(std::clamp(m_color.a, 0.f, 1.f) * 255.f));
+			const auto sourceA = static_cast<BYTE>((static_cast<UINT32>(coverageA) * colorA + 127) / 255);
+			if (!sourceA)
+			{
+				return;
+			}
+
+			const auto colorR = static_cast<UINT32>(std::round(std::clamp(m_color.r, 0.f, 1.f) * colorA));
+			const auto colorG = static_cast<UINT32>(std::round(std::clamp(m_color.g, 0.f, 1.f) * colorA));
+			const auto colorB = static_cast<UINT32>(std::round(std::clamp(m_color.b, 0.f, 1.f) * colorA));
+
+			const BYTE sourceR = static_cast<BYTE>((colorR * coverageR + 127) / 255);
+			const BYTE sourceG = static_cast<BYTE>((colorG * coverageG + 127) / 255);
+			const BYTE sourceB = static_cast<BYTE>((colorB * coverageB + 127) / 255);
+
+			BYTE* pixel = &m_pixels[(static_cast<size_t>(y) * m_width + x) * 4];
+			const UINT32 inverseA = 255 - sourceA;
+			pixel[0] = static_cast<BYTE>(sourceB + (static_cast<UINT32>(pixel[0]) * inverseA + 127) / 255);
+			pixel[1] = static_cast<BYTE>(sourceG + (static_cast<UINT32>(pixel[1]) * inverseA + 127) / 255);
+			pixel[2] = static_cast<BYTE>(sourceR + (static_cast<UINT32>(pixel[2]) * inverseA + 127) / 255);
+			pixel[3] = static_cast<BYTE>(sourceA + (static_cast<UINT32>(pixel[3]) * inverseA + 127) / 255);
+			m_hasPixels = true;
+		}
+
+		HRESULT DrawClearTypeFallback(FLOAT baselineOriginX, FLOAT baselineOriginY, DWRITE_MEASURING_MODE measuringMode, DWRITE_GLYPH_RUN const* glyphRun)
+		{
+			winrt::com_ptr<IDWriteGlyphRunAnalysis> glyphRunAnalysis{};
+			RETURN_IF_FAILED(
+				m_factory->CreateGlyphRunAnalysis(
+					glyphRun,
+					m_pixelsPerDip,
+					nullptr,
+					DWRITE_RENDERING_MODE_CLEARTYPE_NATURAL_SYMMETRIC,
+					measuringMode,
+					baselineOriginX,
+					baselineOriginY,
+					glyphRunAnalysis.put()
+				)
+			);
+
+			RECT textureBounds{};
+			RETURN_IF_FAILED(glyphRunAnalysis->GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1, &textureBounds));
+			const auto textureWidth = static_cast<UINT32>(std::max<LONG>(0, textureBounds.right - textureBounds.left));
+			const auto textureHeight = static_cast<UINT32>(std::max<LONG>(0, textureBounds.bottom - textureBounds.top));
+			if (!textureWidth || !textureHeight)
+			{
+				return S_OK;
+			}
+
+			std::vector<BYTE> texture(static_cast<size_t>(textureWidth) * textureHeight * 3);
+			RETURN_IF_FAILED(
+				glyphRunAnalysis->CreateAlphaTexture(
+					DWRITE_TEXTURE_CLEARTYPE_3x1,
+					&textureBounds,
+					texture.data(),
+					static_cast<UINT32>(texture.size())
+				)
+			);
+
+			for (int y = textureBounds.top; y < textureBounds.bottom; y++)
+			{
+				const int targetY = y - m_bitmapTop;
+				if (targetY < 0 || targetY >= static_cast<int>(m_height))
+				{
+					continue;
+				}
+
+				for (int x = textureBounds.left; x < textureBounds.right; x++)
+				{
+					const int targetX = x - m_bitmapLeft;
+					if (targetX < 0 || targetX >= static_cast<int>(m_width))
+					{
+						continue;
+					}
+
+					const auto textureOffset = (static_cast<size_t>(y - textureBounds.top) * textureWidth + (x - textureBounds.left)) * 3;
+					BlendPixel(
+						static_cast<UINT32>(targetX),
+						static_cast<UINT32>(targetY),
+						texture[textureOffset],
+						texture[textureOffset + 1],
+						texture[textureOffset + 2]
+					);
+				}
+			}
+
+			return S_OK;
+		}
+
+	public:
+		CaptionSubpixelTextRenderer(
+			IDWriteFactory* factory,
+			D2D1_COLOR_F color,
+			std::vector<BYTE>& pixels,
+			UINT32 width,
+			UINT32 height,
+			int bitmapLeft,
+			int bitmapTop,
+			float pixelsPerDip
+		) :
+			m_factory{ factory },
+			m_color{ color },
+			m_pixels{ pixels },
+			m_width{ width },
+			m_height{ height },
+			m_bitmapLeft{ bitmapLeft },
+			m_bitmapTop{ bitmapTop },
+			m_pixelsPerDip{ pixelsPerDip }
+		{ }
+
+		bool HasPixels() const
+		{
+			return m_hasPixels;
+		}
+
+		IFACEMETHOD(QueryInterface)(REFIID riid, void** object) override
+		{
+			if (!object)
+			{
+				return E_POINTER;
+			}
+			*object = nullptr;
+
+			if (riid == __uuidof(IUnknown) || riid == __uuidof(IDWritePixelSnapping) || riid == __uuidof(IDWriteTextRenderer))
+			{
+				*object = static_cast<IDWriteTextRenderer*>(this);
+				AddRef();
+				return S_OK;
+			}
+
+			return E_NOINTERFACE;
+		}
+
+		IFACEMETHOD_(ULONG, AddRef)() override
+		{
+			return ++m_refCount;
+		}
+
+		IFACEMETHOD_(ULONG, Release)() override
+		{
+			const auto refCount = --m_refCount;
+			return refCount;
+		}
+
+		IFACEMETHOD(IsPixelSnappingDisabled)(void*, BOOL* isDisabled) override
+		{
+			if (!isDisabled)
+			{
+				return E_POINTER;
+			}
+			*isDisabled = FALSE;
+			return S_OK;
+		}
+
+		IFACEMETHOD(GetCurrentTransform)(void*, DWRITE_MATRIX* transform) override
+		{
+			if (!transform)
+			{
+				return E_POINTER;
+			}
+			*transform = DWRITE_MATRIX{ 1.f, 0.f, 0.f, 1.f, 0.f, 0.f };
+			return S_OK;
+		}
+
+		IFACEMETHOD(GetPixelsPerDip)(void*, FLOAT* pixelsPerDip) override
+		{
+			if (!pixelsPerDip)
+			{
+				return E_POINTER;
+			}
+			*pixelsPerDip = m_pixelsPerDip;
+			return S_OK;
+		}
+
+		IFACEMETHOD(DrawGlyphRun)(
+			void*,
+			FLOAT baselineOriginX,
+			FLOAT baselineOriginY,
+			DWRITE_MEASURING_MODE measuringMode,
+			DWRITE_GLYPH_RUN const* glyphRun,
+			DWRITE_GLYPH_RUN_DESCRIPTION const*,
+			IUnknown*
+		) override
+		{
+			RETURN_HR_IF_NULL(E_INVALIDARG, glyphRun);
+			RETURN_HR_IF_NULL(E_INVALIDARG, glyphRun->fontFace);
+			RETURN_HR_IF_NULL(E_INVALIDARG, m_factory);
+
+			DWRITE_MATRIX transform{ static_cast<FLOAT>(c_subpixelScale), 0.f, 0.f, 1.f, 0.f, 0.f };
+			winrt::com_ptr<IDWriteGlyphRunAnalysis> glyphRunAnalysis{};
+			const HRESULT createAnalysisHr = m_factory->CreateGlyphRunAnalysis(
+				glyphRun,
+				m_pixelsPerDip,
+				&transform,
+				DWRITE_RENDERING_MODE_ALIASED,
+				measuringMode,
+				baselineOriginX * c_subpixelScale,
+				baselineOriginY,
+				glyphRunAnalysis.put()
+			);
+			if (FAILED(createAnalysisHr))
+			{
+				return DrawClearTypeFallback(baselineOriginX, baselineOriginY, measuringMode, glyphRun);
+			}
+
+			RECT textureBounds{};
+			const HRESULT getBoundsHr = glyphRunAnalysis->GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1, &textureBounds);
+			if (FAILED(getBoundsHr))
+			{
+				return DrawClearTypeFallback(baselineOriginX, baselineOriginY, measuringMode, glyphRun);
+			}
+			const auto maskWidth = static_cast<UINT32>(std::max<LONG>(0, textureBounds.right - textureBounds.left));
+			const auto maskHeight = static_cast<UINT32>(std::max<LONG>(0, textureBounds.bottom - textureBounds.top));
+			if (!maskWidth || !maskHeight)
+			{
+				return S_OK;
+			}
+
+			std::vector<BYTE> mask(static_cast<size_t>(maskWidth) * maskHeight);
+			const HRESULT createTextureHr = glyphRunAnalysis->CreateAlphaTexture(
+				DWRITE_TEXTURE_ALIASED_1x1,
+				&textureBounds,
+				mask.data(),
+				static_cast<UINT32>(mask.size())
+			);
+			if (FAILED(createTextureHr))
+			{
+				return DrawClearTypeFallback(baselineOriginX, baselineOriginY, measuringMode, glyphRun);
+			}
+
+			const int left = static_cast<int>(std::floor(static_cast<float>(textureBounds.left) / c_subpixelScale));
+			const int right = static_cast<int>(std::ceil(static_cast<float>(textureBounds.right) / c_subpixelScale));
+			for (int y = textureBounds.top; y < textureBounds.bottom; y++)
+			{
+				const int targetY = y - m_bitmapTop;
+				if (targetY < 0 || targetY >= static_cast<int>(m_height))
+				{
+					continue;
+				}
+
+				for (int x = left; x < right; x++)
+				{
+					const int targetX = x - m_bitmapLeft;
+					if (targetX < 0 || targetX >= static_cast<int>(m_width))
+					{
+						continue;
+					}
+
+					const BYTE coverageR = AverageCoverage(mask, maskWidth, maskHeight, x, y, textureBounds, 0);
+					const BYTE coverageG = AverageCoverage(mask, maskWidth, maskHeight, x, y, textureBounds, 2);
+					const BYTE coverageB = AverageCoverage(mask, maskWidth, maskHeight, x, y, textureBounds, 4);
+					BlendPixel(static_cast<UINT32>(targetX), static_cast<UINT32>(targetY), coverageR, coverageG, coverageB);
+				}
+			}
+
+			return S_OK;
+		}
+
+		IFACEMETHOD(DrawUnderline)(void*, FLOAT, FLOAT, DWRITE_UNDERLINE const*, IUnknown*) override
+		{
+			return S_OK;
+		}
+
+		IFACEMETHOD(DrawStrikethrough)(void*, FLOAT, FLOAT, DWRITE_STRIKETHROUGH const*, IUnknown*) override
+		{
+			return S_OK;
+		}
+
+		IFACEMETHOD(DrawInlineObject)(void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override
+		{
+			return S_OK;
+		}
+	};
+
+	HRESULT DrawSubpixelTextLayout(
+		ID2D1DeviceContext* context,
+		D2D1_POINT_2F origin,
+		IDWriteTextLayout* textLayout,
+		D2D1_COLOR_F color
+	)
+	{
+		RETURN_HR_IF_NULL(E_INVALIDARG, context);
+		RETURN_HR_IF_NULL(E_INVALIDARG, textLayout);
+
+		DWRITE_TEXT_METRICS metrics{};
+		RETURN_IF_FAILED(textLayout->GetMetrics(&metrics));
+		if (!metrics.width || !metrics.height)
+		{
+			return S_FALSE;
+		}
+
 		DWRITE_OVERHANG_METRICS overhangs{};
-		THROW_IF_FAILED(textLayout->GetOverhangMetrics(&overhangs));
+		RETURN_IF_FAILED(textLayout->GetOverhangMetrics(&overhangs));
 
-		return
+		const int bitmapLeft = static_cast<int>(std::floor(metrics.left - overhangs.left)) - 2;
+		const int bitmapTop = static_cast<int>(std::floor(metrics.top - overhangs.top)) - 2;
+		const int bitmapRight = static_cast<int>(std::ceil(metrics.left + metrics.width + overhangs.right)) + 2;
+		const int bitmapBottom = static_cast<int>(std::ceil(metrics.top + metrics.height + overhangs.bottom)) + 2;
+		const UINT32 bitmapWidth = static_cast<UINT32>(std::max(0, bitmapRight - bitmapLeft));
+		const UINT32 bitmapHeight = static_cast<UINT32>(std::max(0, bitmapBottom - bitmapTop));
+		if (!bitmapWidth || !bitmapHeight)
 		{
-			origin.x + (std::floor(-overhangs.left) - 1.f),
-			origin.y + std::floor(metrics.top) - 1.f,
-			origin.x + (std::floor(-overhangs.left) - 1.f) + g_textSizeF.Width,
-			origin.y + std::floor(metrics.top + metrics.height) + 1.f
-		};
-	}
+			return S_FALSE;
+		}
 
-	winrt::com_ptr<IDWriteInlineObject> CreateEllipsisTrimmingSignForLayout(IDWriteTextLayout* textLayout)
-	{
-		static winrt::com_ptr<IDWriteFactory> s_dwriteFactory{};
-		if (!s_dwriteFactory)
+		static winrt::com_ptr<IDWriteFactory> dwriteFactory{};
+		if (!dwriteFactory)
 		{
-			THROW_IF_FAILED(
+			RETURN_IF_FAILED(
 				DWriteCreateFactory(
 					DWRITE_FACTORY_TYPE_SHARED,
 					__uuidof(IDWriteFactory),
-					reinterpret_cast<IUnknown**>(s_dwriteFactory.put())
+					reinterpret_cast<IUnknown**>(dwriteFactory.put())
 				)
 			);
 		}
 
-		const auto fontFamilyLength = textLayout->GetFontFamilyNameLength();
-		std::wstring fontFamily(fontFamilyLength + 1, L'\0');
-		THROW_IF_FAILED(textLayout->GetFontFamilyName(fontFamily.data(), static_cast<UINT32>(fontFamily.size())));
-		fontFamily.resize(fontFamilyLength);
+		FLOAT dpiX{ 96.f };
+		FLOAT dpiY{ 96.f };
+		context->GetDpi(&dpiX, &dpiY);
+		const float pixelsPerDip = dpiX > 0.f ? dpiX / 96.f : 1.f;
 
-		const auto localeLength = textLayout->GetLocaleNameLength();
-		std::wstring locale(localeLength + 1, L'\0');
-		THROW_IF_FAILED(textLayout->GetLocaleName(locale.data(), static_cast<UINT32>(locale.size())));
-		locale.resize(localeLength);
+		std::vector<BYTE> pixels(static_cast<size_t>(bitmapWidth) * bitmapHeight * 4);
+		CaptionSubpixelTextRenderer renderer{ dwriteFactory.get(), color, pixels, bitmapWidth, bitmapHeight, bitmapLeft, bitmapTop, pixelsPerDip };
+		RETURN_IF_FAILED(textLayout->Draw(nullptr, &renderer, 0.f, 0.f));
+		if (!renderer.HasPixels())
+		{
+			return S_FALSE;
+		}
 
-		winrt::com_ptr<IDWriteTextFormat> textFormat{};
-		THROW_IF_FAILED(
-			s_dwriteFactory->CreateTextFormat(
-				fontFamily.c_str(),
-				nullptr,
-				textLayout->GetFontWeight(),
-				textLayout->GetFontStyle(),
-				textLayout->GetFontStretch(),
-				textLayout->GetFontSize(),
-				locale.empty() ? L"" : locale.c_str(),
-				textFormat.put()
+		winrt::com_ptr<ID2D1Bitmap1> bitmap{};
+		RETURN_IF_FAILED(
+			context->CreateBitmap(
+				D2D1::SizeU(bitmapWidth, bitmapHeight),
+				pixels.data(),
+				bitmapWidth * 4,
+				D2D1::BitmapProperties1(
+					D2D1_BITMAP_OPTIONS_NONE,
+					D2D1::PixelFormat(
+						DXGI_FORMAT_B8G8R8A8_UNORM,
+						D2D1_ALPHA_MODE_PREMULTIPLIED
+					)
+				),
+				bitmap.put()
 			)
 		);
-		THROW_IF_FAILED(textFormat->SetTextAlignment(textLayout->GetTextAlignment()));
-		THROW_IF_FAILED(textFormat->SetParagraphAlignment(textLayout->GetParagraphAlignment()));
-		THROW_IF_FAILED(textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP));
 
-		winrt::com_ptr<IDWriteInlineObject> ellipsis{};
-		THROW_IF_FAILED(s_dwriteFactory->CreateEllipsisTrimmingSign(textFormat.get(), ellipsis.put()));
-		return ellipsis;
+		const D2D1_RECT_F destinationRect
+		{
+			origin.x + static_cast<float>(bitmapLeft),
+			origin.y + static_cast<float>(bitmapTop),
+			origin.x + static_cast<float>(bitmapLeft + static_cast<int>(bitmapWidth)),
+			origin.y + static_cast<float>(bitmapTop + static_cast<int>(bitmapHeight))
+		};
+		context->DrawBitmap(
+			bitmap.get(),
+			&destinationRect,
+			1.f,
+			D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+			nullptr,
+			nullptr
+		);
+
+		return S_OK;
 	}
 
-	void ApplyCaptionTextEllipsis(IDWriteTextLayout* textLayout)
+	void CalculateRealizedTextGlowParams(int textGlowMode);
+}
+
+bool CaptionTextHandler::DrawGdiSubpixelText(
+	HDC hdc,
+	LPCWSTR text,
+	int textLength,
+	const RECT& drawRect,
+	UINT format,
+	COLORREF color
+)
+{
+	if (!g_captionSubpixelTextRenderer)
 	{
-		if (!g_dwriteTextVisual)
-		{
-			return;
-		}
-
-		const auto maxWidth = static_cast<float>(g_dwriteTextVisual->GetWidth());
-		const auto maxHeight = static_cast<float>(g_dwriteTextVisual->GetHeight());
-		if (maxWidth <= 0.f || maxHeight <= 0.f)
-		{
-			return;
-		}
-
-		THROW_IF_FAILED(textLayout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP));
-
-		DWRITE_TRIMMING trimming{};
-		winrt::com_ptr<IDWriteInlineObject> trimmingSign{};
-		THROW_IF_FAILED(textLayout->GetTrimming(&trimming, trimmingSign.put()));
-		if (trimming.granularity == DWRITE_TRIMMING_GRANULARITY_NONE)
-		{
-			trimming.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
-			trimmingSign = CreateEllipsisTrimmingSignForLayout(textLayout);
-			THROW_IF_FAILED(textLayout->SetTrimming(&trimming, trimmingSign.get()));
-		}
-
-		THROW_IF_FAILED(textLayout->SetMaxWidth(maxWidth));
-		THROW_IF_FAILED(textLayout->SetMaxHeight(maxHeight));
+		return false;
 	}
 
-	void FillOpaqueTextBackground(ID2D1DeviceContext* context, const D2D1_RECT_F& textBoundingBox, const CWindowState& windowState)
+	BITMAP destinationBitmap{};
+	if (!GetObjectW(GetCurrentObject(hdc, OBJ_BITMAP), sizeof(destinationBitmap), &destinationBitmap) || !destinationBitmap.bmBits || destinationBitmap.bmBitsPixel != 32)
 	{
-		const auto backgroundColor = GetOpaqueCaptionBackgroundColor(windowState);
-		if (!g_textBackgroundBrush)
-		{
-			THROW_IF_FAILED(context->CreateSolidColorBrush(backgroundColor, g_textBackgroundBrush.put()));
-		}
-		else
-		{
-			g_textBackgroundBrush->SetColor(backgroundColor);
-		}
-
-		context->FillRectangle(textBoundingBox, g_textBackgroundBrush.get());
+		return false;
 	}
 
-
-	int DrawCaptionTextDirectWrite(HDC hdc, LPCWSTR lpchText, int cchText, LPRECT lprc, UINT format, COLORREF textColor)
+	const LONG width = std::max<LONG>(drawRect.right - drawRect.left, 0);
+	const LONG height = std::max<LONG>(drawRect.bottom - drawRect.top, 0);
+	if (!width || !height)
 	{
-		const UINT textLength = static_cast<UINT>(cchText < 0 ? wcslen(lpchText) : cchText);
-		if (!textLength)
+		return false;
+	}
+
+	LOGFONTW logFont{};
+	HFONT currentFont = reinterpret_cast<HFONT>(GetCurrentObject(hdc, OBJ_FONT));
+	if (!GetObjectW(currentFont, sizeof(logFont), &logFont))
+	{
+		return false;
+	}
+
+	TEXTMETRICW textMetric{};
+	if (!GetTextMetricsW(hdc, &textMetric))
+	{
+		return false;
+	}
+
+	constexpr LONG samplePadding = c_captionSubpixelScale;
+	const LONG scaledWidth = width * c_captionSubpixelScale;
+
+	LOGFONTW measuringLogFont{ logFont };
+	measuringLogFont.lfHeight *= c_captionSubpixelScale;
+	measuringLogFont.lfWidth *= c_captionSubpixelScale;
+	measuringLogFont.lfQuality = NONANTIALIASED_QUALITY;
+	wil::unique_hfont measuringFont{ CreateFontIndirectW(&measuringLogFont) };
+	if (!measuringFont)
+	{
+		return false;
+	}
+
+	SaveDC(hdc);
+	const auto cleanupMeasureDC = wil::scope_exit([&]
+	{
+		RestoreDC(hdc, -1);
+	});
+	SelectObject(hdc, measuringFont.get());
+	TEXTMETRICW scaledTextMetric{};
+	if (!GetTextMetricsW(hdc, &scaledTextMetric))
+	{
+		return false;
+	}
+
+	LOGFONTW scaledLogFont{ logFont };
+	scaledLogFont.lfWidth = scaledTextMetric.tmAveCharWidth;
+	scaledLogFont.lfQuality = NONANTIALIASED_QUALITY;
+	wil::unique_hfont scaledFont{ CreateFontIndirectW(&scaledLogFont) };
+	if (!scaledFont)
+	{
+		return false;
+	}
+
+	struct CMonoBitmapInfo
+	{
+		BITMAPINFOHEADER header;
+		RGBQUAD colors[2];
+	} maskBitmapInfo{};
+	maskBitmapInfo.header.biSize = sizeof(maskBitmapInfo.header);
+	maskBitmapInfo.header.biWidth = scaledWidth + samplePadding * 2;
+	maskBitmapInfo.header.biHeight = -height;
+	maskBitmapInfo.header.biPlanes = 1;
+	maskBitmapInfo.header.biBitCount = 1;
+	maskBitmapInfo.header.biCompression = BI_RGB;
+	maskBitmapInfo.colors[0] = RGBQUAD{ 0, 0, 0, 0 };
+	maskBitmapInfo.colors[1] = RGBQUAD{ 0xFF, 0xFF, 0xFF, 0 };
+
+	PVOID maskBits{};
+	wil::unique_hbitmap maskBitmap{ CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&maskBitmapInfo), DIB_RGB_COLORS, &maskBits, nullptr, 0) };
+	if (!maskBitmap || !maskBits)
+	{
+		return false;
+	}
+
+	const LONG maskStrideBytes = ((maskBitmapInfo.header.biWidth + 31) / 32) * 4;
+	memset(maskBits, 0, static_cast<size_t>(maskStrideBytes) * height);
+
+	wil::unique_hdc maskDC{ CreateCompatibleDC(nullptr) };
+	if (!maskDC)
+	{
+		return false;
+	}
+
+	SaveDC(maskDC.get());
+	const auto cleanupMaskDC = wil::scope_exit([&]
+	{
+		RestoreDC(maskDC.get(), -1);
+	});
+	SelectObject(maskDC.get(), maskBitmap.get());
+	SelectObject(maskDC.get(), scaledFont.get());
+	SetBkMode(maskDC.get(), TRANSPARENT);
+	SetBkColor(maskDC.get(), RGB(0, 0, 0));
+	SetTextColor(maskDC.get(), RGB(255, 255, 255));
+	if (format & DT_RTLREADING)
+	{
+		SetTextAlign(maskDC.get(), GetTextAlign(maskDC.get()) | TA_RTLREADING);
+	}
+
+	RECT maskRect{ samplePadding, 0, samplePadding + scaledWidth, height };
+	if (!g_DrawTextW_Org(maskDC.get(), text, textLength, &maskRect, format & ~DT_CALCRECT))
+	{
+		return false;
+	}
+
+	BYTE* destinationPixels = static_cast<BYTE*>(destinationBitmap.bmBits);
+	const LONG destinationStride = destinationBitmap.bmWidthBytes;
+	const LONG destinationHeight = std::abs(destinationBitmap.bmHeight);
+	const LONG destinationWidth = destinationBitmap.bmWidth;
+	const BYTE colorR = GetRValue(color);
+	const BYTE colorG = GetGValue(color);
+	const BYTE colorB = GetBValue(color);
+	bool drewPixels = false;
+
+	const auto maskSample = [maskBits, maskStrideBytes, maskWidth = maskBitmapInfo.header.biWidth, height](LONG x, LONG y) noexcept -> int
+	{
+		if (x < 0 || x >= maskWidth || y < 0 || y >= height)
 		{
-			RECT calcRect{ *lprc };
-			return g_DrawTextW_Org(hdc, lpchText, cchText, &calcRect, format | DT_CALCRECT);
+			return 0;
 		}
 
+		const auto row = static_cast<const BYTE*>(maskBits) + static_cast<size_t>(y) * maskStrideBytes;
+		return (row[x / 8] >> (7 - (x % 8))) & 1;
+	};
 
-		BITMAP destBitmapInfo{};
-		if (!GetObjectW(GetCurrentObject(hdc, OBJ_BITMAP), sizeof(destBitmapInfo), &destBitmapInfo) || !destBitmapInfo.bmBits)
+	const auto filterChannel = [&maskSample](LONG baseX, LONG y, LONG firstSample) noexcept -> BYTE
+	{
+		static constexpr BYTE sc_filterTable61[]
 		{
-			return g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
-		}
-
-
-		LOGFONTW logFont{};
-		if (!GetObjectW(GetCurrentObject(hdc, OBJ_FONT), sizeof(logFont), &logFont))
-		{
-			return g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
-		}
-
-
-		TEXTMETRICW textMetric{};
-		if (!GetTextMetricsW(hdc, &textMetric))
-		{
-			return g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
-		}
-
-
-		constexpr LONG scaleX = 6;
-		constexpr LONG samplePadding = 6;
-		constexpr LONG widthScaleNumerator = scaleX * 17;
-		constexpr LONG widthScaleDenominator = 16;
-
-
-		LOGFONTW widenedLogFont{ logFont };
-		const LONG baseWidth = std::max<LONG>(std::abs(logFont.lfWidth ? logFont.lfWidth : textMetric.tmAveCharWidth), 1l);
-		widenedLogFont.lfWidth = std::max<LONG>(static_cast<LONG>(MulDiv(baseWidth, widthScaleNumerator, widthScaleDenominator)), 1l);
-		HFONT widenedFont = CreateFontIndirectW(&widenedLogFont);
-		THROW_LAST_ERROR_IF_NULL(widenedFont);
-		const auto widenedFontScope = wil::scope_exit([widenedFont]
-		{
-			DeleteObject(widenedFont);
-		});
-
-
-		HDC maskDC = CreateCompatibleDC(nullptr);
-		THROW_LAST_ERROR_IF_NULL(maskDC);
-		const auto maskDCScope = wil::scope_exit([maskDC]
-		{
-			DeleteDC(maskDC);
-		});
-
-
-		const LONG layoutWidth = std::max<LONG>(wil::rect_width(*lprc), 1l);
-		const LONG layoutHeight = std::max<LONG>(wil::rect_height(*lprc), 1l);
-		const LONG scaledLayoutWidth = std::max<LONG>(static_cast<LONG>(MulDiv(layoutWidth, widthScaleNumerator, widthScaleDenominator)), 1l);
-
-
-		struct CMonoBitmapInfo
-		{
-			BITMAPINFOHEADER header;
-			RGBQUAD colors[2];
-		} bitmapInfo{};
-		bitmapInfo.header.biSize = sizeof(BITMAPINFOHEADER);
-		bitmapInfo.header.biWidth = scaledLayoutWidth + samplePadding * 2;
-		bitmapInfo.header.biHeight = -layoutHeight;
-		bitmapInfo.header.biPlanes = 1;
-		bitmapInfo.header.biBitCount = 1;
-		bitmapInfo.header.biCompression = BI_RGB;
-		bitmapInfo.colors[0] = RGBQUAD{ 0, 0, 0, 0 };
-		bitmapInfo.colors[1] = RGBQUAD{ 0xFF, 0xFF, 0xFF, 0 };
-
-
-		PVOID maskBits{ nullptr };
-		wil::unique_hbitmap maskBitmap{ CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&bitmapInfo), DIB_RGB_COLORS, &maskBits, nullptr, 0) };
-		THROW_LAST_ERROR_IF_NULL(maskBitmap.get());
-		memset(maskBits, 0, static_cast<size_t>(((bitmapInfo.header.biWidth + 31) / 32) * 4) * static_cast<size_t>(layoutHeight));
-
-
-		const auto oldBitmap = SelectObject(maskDC, maskBitmap.get());
-		const auto bitmapScope = wil::scope_exit([maskDC, oldBitmap]
-		{
-			SelectObject(maskDC, oldBitmap);
-		});
-		const auto oldFont = SelectObject(maskDC, widenedFont);
-		const auto fontScope = wil::scope_exit([maskDC, oldFont]
-		{
-			SelectObject(maskDC, oldFont);
-		});
-
-
-		SetBkMode(maskDC, TRANSPARENT);
-		SetBkColor(maskDC, RGB(0, 0, 0));
-		SetTextColor(maskDC, RGB(255, 255, 255));
-
-
-		const UINT drawFormat = format & ~DT_CALCRECT;
-		RECT maskRect{ samplePadding, 0, samplePadding + scaledLayoutWidth, layoutHeight };
-		if (format & DT_RTLREADING)
-		{
-			SetTextAlign(maskDC, GetTextAlign(maskDC) | TA_RTLREADING);
-		}
-
-
-		if (!g_DrawTextW_Org(maskDC, lpchText, cchText, &maskRect, drawFormat))
-		{
-			RECT calcRect{ *lprc };
-			return g_DrawTextW_Org(hdc, lpchText, cchText, &calcRect, format | DT_CALCRECT);
-		}
-
-
-		auto* dstPixels = static_cast<DWORD*>(destBitmapInfo.bmBits);
-		const auto dstStride = static_cast<size_t>(destBitmapInfo.bmWidthBytes) / sizeof(DWORD);
-		const LONG destWidth = destBitmapInfo.bmWidth;
-		const LONG destHeight = std::abs(destBitmapInfo.bmHeight);
-		const LONG maskStrideBytes = ((bitmapInfo.header.biWidth + 31) / 32) * 4;
-		const BYTE textR = GetRValue(textColor);
-		const BYTE textG = GetGValue(textColor);
-		const BYTE textB = GetBValue(textColor);
-
-
-		auto blendChannel = [](BYTE dst, BYTE src, BYTE alpha) noexcept -> BYTE
-		{
-			return static_cast<BYTE>((static_cast<UINT32>(src) * alpha + static_cast<UINT32>(dst) * (255u - alpha) + 127u) / 255u);
+			0x00, 0x2A, 0x55, 0x7F, 0xAA, 0xD4, 0xFF
 		};
 
-
-		auto maskSample = [maskBits, maskStrideBytes, maskWidth = bitmapInfo.header.biWidth, maskHeight = layoutHeight](LONG x, LONG y) noexcept -> int
+		int weight{};
+		for (LONG sample = 0; sample < c_captionSubpixelScale; sample++)
 		{
-			if (x < 0 || x >= maskWidth || y < 0 || y >= maskHeight)
-			{
-				return 0;
-			}
-			const auto row = static_cast<const BYTE*>(maskBits) + static_cast<size_t>(y) * maskStrideBytes;
-			return (row[x / 8] >> (7 - (x % 8))) & 0x1;
-		};
+			weight += maskSample(baseX + firstSample + sample, y);
+		}
+		return sc_filterTable61[weight];
+	};
 
 
-		auto filterChannel = [&maskSample](LONG baseX, LONG y, LONG offset0, LONG offset1, LONG offset2) noexcept -> BYTE
+	const auto adjustCoverage = [colorR, colorG, colorB](BYTE coverage) noexcept -> BYTE
+	{
+		static constexpr float c_gammaG1 = -0.2442999929f;
+		static constexpr float c_gammaG2 = 0.2309000045f;
+		static constexpr float c_gammaG3 = 0.02332499996f;
+		static constexpr float c_gammaG4 = -0.1290249974f;
+		const float colorAverage = (static_cast<float>(colorR) + 2.f * colorG + colorB) / (4.f * 255.f);
+		const float gammaCoefficient1 = colorAverage * c_gammaG1 + c_gammaG2;
+		const float gammaCoefficient2 = colorAverage * c_gammaG3 + c_gammaG4;
+		const float alpha = static_cast<float>(coverage) / 255.f;
+		const float adjusted = std::clamp(
+			alpha + alpha * (1.f - alpha) * (alpha * gammaCoefficient1 + gammaCoefficient2),
+			0.f,
+			1.f
+		);
+		return static_cast<BYTE>(adjusted * 255.f + 0.5f);
+	};
+
+	for (LONG y = 0; y < height; y++)
+	{
+		const LONG destinationY = drawRect.top + y;
+		if (destinationY < 0 || destinationY >= destinationHeight)
 		{
-			const int s0 = maskSample(baseX + offset0, y);
-			const int s1 = maskSample(baseX + offset1, y);
-			const int s2 = maskSample(baseX + offset2, y);
-			const int weight = s0 + (s1 * 2) + s2;
-			return static_cast<BYTE>((weight * 255 + 2) / 4);
-		};
+			continue;
+		}
 
-
-		for (LONG y = 0; y < layoutHeight; y++)
+		const LONG physicalY = destinationY;
+		for (LONG x = 0; x < width; x++)
 		{
-			const LONG destY = lprc->top + y;
-			if (destY < 0 || destY >= destHeight)
+			const LONG destinationX = drawRect.left + x;
+			if (destinationX < 0 || destinationX >= destinationWidth)
 			{
 				continue;
 			}
 
-
-			for (LONG x = 0; x < layoutWidth; x++)
+			const LONG sampleBase = samplePadding + x * c_captionSubpixelScale;
+			const BYTE coverageR = filterChannel(sampleBase, y, -2);
+			const BYTE coverageG = filterChannel(sampleBase, y, 0);
+			const BYTE coverageB = filterChannel(sampleBase, y, 2);
+			const BYTE coverageA = std::max({ coverageR, coverageG, coverageB });
+			if (!coverageA)
 			{
-				const LONG destX = lprc->left + x;
-				if (destX < 0 || destX >= destWidth)
-				{
-					continue;
-				}
-
-
-				const LONG sampleBase = samplePadding + x * scaleX;
-				const BYTE alphaR = filterChannel(sampleBase, y, 0, 1, 2);
-				const BYTE alphaG = filterChannel(sampleBase, y, 2, 3, 4);
-				const BYTE alphaB = filterChannel(sampleBase, y, 4, 5, 6);
-				const BYTE alphaAvg = static_cast<BYTE>((static_cast<UINT32>(alphaR) + alphaG + alphaB + 1u) / 3u);
-				if (!alphaAvg)
-				{
-					continue;
-				}
-
-
-				const size_t destIndex = static_cast<size_t>(destY) * dstStride + destX;
-				const DWORD dstPixel = dstPixels[destIndex];
-				const BYTE dstA = static_cast<BYTE>((dstPixel & 0xFF000000) >> 24);
-				const BYTE dstR = static_cast<BYTE>((dstPixel & 0x00FF0000) >> 16);
-				const BYTE dstG = static_cast<BYTE>((dstPixel & 0x0000FF00) >> 8);
-				const BYTE dstB = static_cast<BYTE>((dstPixel & 0x000000FF) >> 0);
-
-
-				const BYTE outR = blendChannel(dstR, textR, alphaR);
-				const BYTE outG = blendChannel(dstG, textG, alphaG);
-				const BYTE outB = blendChannel(dstB, textB, alphaB);
-				const BYTE outA = blendChannel(dstA, 255, alphaAvg);
-
-
-				dstPixels[destIndex] = (static_cast<DWORD>(outA) << 24) | (static_cast<DWORD>(outR) << 16) | (static_cast<DWORD>(outG) << 8) | static_cast<DWORD>(outB);
+				continue;
 			}
+
+			BYTE* destinationPixel = destinationPixels + static_cast<size_t>(physicalY) * destinationStride + destinationX * 4;
+			const BYTE destinationA = destinationPixel[3];
+			const BYTE adjustedCoverageB = adjustCoverage(coverageB);
+			const BYTE adjustedCoverageG = adjustCoverage(coverageG);
+			const BYTE adjustedCoverageR = adjustCoverage(coverageR);
+			// Lighten edge coverage: reduce mid-range values while preserving 0 and 255
+			// pow(x, 1.6) reduces mid-tone coverage, making text slightly lighter at edges
+			static constexpr float c_lightenPow = 1.8f;
+			const BYTE finalCoverageB = static_cast<BYTE>(std::pow(static_cast<float>(adjustedCoverageB) / 255.f, c_lightenPow) * 255.f + 0.5f);
+			const BYTE finalCoverageG = static_cast<BYTE>(std::pow(static_cast<float>(adjustedCoverageG) / 255.f, c_lightenPow) * 255.f + 0.5f);
+			const BYTE finalCoverageR = static_cast<BYTE>(std::pow(static_cast<float>(adjustedCoverageR) / 255.f, c_lightenPow) * 255.f + 0.5f);
+			const BYTE finalCoverageA = std::max({ finalCoverageR, finalCoverageG, finalCoverageB });
+			destinationPixel[0] = static_cast<BYTE>((static_cast<UINT32>(colorB) * finalCoverageB + static_cast<UINT32>(destinationPixel[0]) * (255 - finalCoverageB) + 127) / 255);
+			destinationPixel[1] = static_cast<BYTE>((static_cast<UINT32>(colorG) * finalCoverageG + static_cast<UINT32>(destinationPixel[1]) * (255 - finalCoverageG) + 127) / 255);
+			destinationPixel[2] = static_cast<BYTE>((static_cast<UINT32>(colorR) * finalCoverageR + static_cast<UINT32>(destinationPixel[2]) * (255 - finalCoverageR) + 127) / 255);
+			destinationPixel[3] = static_cast<BYTE>(finalCoverageA + (static_cast<UINT32>(destinationA) * (255 - finalCoverageA) + 127) / 255);
+			drewPixels = true;
 		}
-
-
-		RECT calcRect{ *lprc };
-		return g_DrawTextW_Org(hdc, lpchText, cchText, &calcRect, format | DT_CALCRECT);
 	}
 
+	return drewPixels;
+}
 
+bool CaptionTextHandler::MeasureGdiSubpixelText(
+	HDC hdc,
+	LPCWSTR text,
+	int textLength,
+	LPRECT rect,
+	UINT format
+)
+{
+	if (!g_captionSubpixelTextRenderer || !rect)
+	{
+		return false;
+	}
+
+	LOGFONTW logFont{};
+	HFONT currentFont = reinterpret_cast<HFONT>(GetCurrentObject(hdc, OBJ_FONT));
+	if (!GetObjectW(currentFont, sizeof(logFont), &logFont))
+	{
+		return false;
+	}
+
+	LOGFONTW measuringLogFont{ logFont };
+	measuringLogFont.lfHeight *= c_captionSubpixelScale;
+	measuringLogFont.lfWidth *= c_captionSubpixelScale;
+	measuringLogFont.lfQuality = NONANTIALIASED_QUALITY;
+	wil::unique_hfont measuringFont{ CreateFontIndirectW(&measuringLogFont) };
+	if (!measuringFont)
+	{
+		return false;
+	}
+
+	SaveDC(hdc);
+	const auto cleanupMeasureDC = wil::scope_exit([&]
+	{
+		RestoreDC(hdc, -1);
+	});
+	SelectObject(hdc, measuringFont.get());
+	TEXTMETRICW scaledTextMetric{};
+	if (!GetTextMetricsW(hdc, &scaledTextMetric))
+	{
+		return false;
+	}
+
+	LOGFONTW scaledLogFont{ logFont };
+	scaledLogFont.lfWidth = scaledTextMetric.tmAveCharWidth;
+	scaledLogFont.lfQuality = NONANTIALIASED_QUALITY;
+	wil::unique_hfont scaledFont{ CreateFontIndirectW(&scaledLogFont) };
+	if (!scaledFont)
+	{
+		return false;
+	}
+	SelectObject(hdc, scaledFont.get());
+
+	RECT scaledRect
+	{
+		rect->left * c_captionSubpixelScale,
+		rect->top,
+		rect->right * c_captionSubpixelScale,
+		rect->bottom
+	};
+	if (!g_DrawTextW_Org(hdc, text, textLength, &scaledRect, format))
+	{
+		return false;
+	}
+
+	rect->left = scaledRect.left / c_captionSubpixelScale;
+	rect->top = scaledRect.top;
+	rect->right = (scaledRect.right + c_captionSubpixelScale - 1) / c_captionSubpixelScale;
+	rect->bottom = scaledRect.bottom;
+	return true;
 }
 
 int WINAPI CaptionTextHandler::MyDrawTextW(
@@ -485,15 +874,15 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 
 	if ((format & DT_CALCRECT))
 	{
+		if (MeasureGdiSubpixelText(hdc, lpchText, cchText, lprc, format))
+		{
+			return lprc->bottom - lprc->top;
+		}
 		return g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
 	}
+	// clear the background, so the text can be shown transparent
+	// with this hack, we don't need to hook FillRect any more
 	BITMAP bmp{};
-	OffsetRect(lprc, GetLegacyTextSurfacePadding(), GetLegacyTextSurfacePadding());
-
-	const auto& windowState = g_textVisualStateMap[g_dwriteTextVisual];
-	const auto textColor = GetTextColor(hdc);
-	const auto textColorOverride = GetResolvedCaptionTextColor(windowState, textColor);
-
 	if (GetObjectW(GetCurrentObject(hdc, OBJ_BITMAP), sizeof(bmp), &bmp) && bmp.bmBits)
 	{
 		memset(
@@ -503,9 +892,33 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 		);
 	}
 
+	OffsetRect(lprc, GetLegacyTextSurfacePadding(), GetLegacyTextSurfacePadding());
+
+	const auto& windowState = g_textVisualStateMap[g_dwriteTextVisual];
+	const auto textColor = GetTextColor(hdc);
+	const auto textColorOverride = windowState.active ? (windowState.maximized ? g_captionActiveColorMaximized : g_captionActiveColor) : (windowState.maximized ? g_captionInactiveColorMaximized : g_captionInactiveColor);
+	DTTOPTS options
+	{
+		sizeof(DTTOPTS),
+		DTT_TEXTCOLOR | DTT_COMPOSITED | DTT_CALLBACK | DTT_GLOWSIZE,
+		textColorOverride != 0xFFFFFFFF ? textColorOverride : textColor,
+		0,
+		0,
+		0,
+		{},
+		0,
+		0,
+		0,
+		0,
+		FALSE,
+		0,
+		drawTextCallback,
+		(LPARAM)&result
+	};
+
 	auto glowDrawRect = *lprc;
 
-	if (Shared::g_textGlowMode == 1 || Shared::g_textGlowMode == 2)
+	if (LOWORD(Shared::g_textGlowMode) == 1 || LOWORD(Shared::g_textGlowMode) == 2)
 	{
 		glowDrawRect.left -= g_contentMargins.cxLeftWidth;
 		glowDrawRect.top -= g_contentMargins.cyTopHeight;
@@ -514,6 +927,7 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 	}
 	else if (LOWORD(Shared::g_textGlowMode) == 3)
 	{
+		options.iGlowSize = g_textGlowSize;
 		glowDrawRect.left -= g_textGlowSize;
 		glowDrawRect.top -= g_textGlowSize;
 		glowDrawRect.right += g_textGlowSize;
@@ -547,15 +961,14 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 	auto glowClipRect = glowDrawRect;
 	calcGlowClipRect(lprc, glowClipRect, g_textVisual->IsRTLMirrored());
 
-	SaveDC(hdc);
-	const auto dcPaintScope = wil::scope_exit([hdc]
+	if (LOWORD(Shared::g_textGlowMode) == 1 || LOWORD(Shared::g_textGlowMode) == 2)
 	{
-		RestoreDC(hdc, -1);
-	});
-	IntersectClipRect(hdc, glowClipRect.left, glowClipRect.top, glowClipRect.right, glowClipRect.bottom);
-
-	if (Shared::g_textGlowMode == 1 || Shared::g_textGlowMode == 2)
-	{
+		SaveDC(hdc);
+		auto glowClipScope = wil::scope_exit([hdc]
+		{
+			RestoreDC(hdc, -1);
+		});
+		IntersectClipRect(hdc, glowClipRect.left, glowClipRect.top, glowClipRect.right, glowClipRect.bottom);
 		if (!g_textGlowRT)
 		{
 			winrt::com_ptr<ID2D1Factory> factory{};
@@ -597,10 +1010,10 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 
 		RECT targetRect
 		{
-			lprc->left - g_textGlowSize,
-			lprc->top - g_textGlowSize,
-			lprc->right + g_textGlowSize,
-			lprc->bottom + g_textGlowSize
+			lprc->left - GetLegacyTextSurfacePadding(),
+			lprc->top - GetLegacyTextSurfacePadding(),
+			lprc->right + GetLegacyTextSurfacePadding(),
+			lprc->bottom + GetLegacyTextSurfacePadding()
 		};
 		g_textGlowRT->BindDC(hdc, &targetRect);
 		g_textGlowRT->BeginDraw();
@@ -614,9 +1027,10 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 				static_cast<float>(glowDrawRect.bottom)
 			),
 			g_sizingMargins,
-			Shared::g_textGlowMode == 2 ? (windowState.active ? (windowState.maximized ? Shared::g_glowOpacityMaximized : Shared::g_glowOpacity) : (windowState.maximized ? Shared::g_glowOpacityInactiveMaximized : Shared::g_glowOpacityInactive)) : 1.f
+			LOWORD(Shared::g_textGlowMode) == 2 ? (windowState.active ? (windowState.maximized ? Shared::g_glowOpacityMaximized : Shared::g_glowOpacity) : (windowState.maximized ? Shared::g_glowOpacityInactiveMaximized : Shared::g_glowOpacityInactive)) : 1.f
 		);
 		LOG_IF_FAILED(g_textGlowRT->EndDraw());
+		glowClipScope.reset();
 		/*{
 			FrameRect(
 				hdc,
@@ -625,29 +1039,12 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 			);
 		}*/
 	}
-	else if (LOWORD(Shared::g_textGlowMode) == 3)
+
+	if (LOWORD(Shared::g_textGlowMode) == 3)
 	{
 		wil::unique_htheme hTheme{ OpenThemeData(nullptr, L"CompositedWindow::Window") };
 		if (hTheme)
 		{
-			DTTOPTS options
-			{
-				sizeof(DTTOPTS),
-				DTT_TEXTCOLOR | DTT_COMPOSITED | DTT_CALLBACK | DTT_APPLYOVERLAY | DTT_GLOWSIZE,
-				textColorOverride,
-				0,
-				0,
-				0,
-				{},
-				0,
-				0,
-				0,
-				0,
-				FALSE,
-				g_textGlowSize,
-				drawTextCallback,
-				(LPARAM)&result
-			};
 			THROW_IF_FAILED(
 				DrawThemeTextEx(
 					hTheme.get(),
@@ -662,19 +1059,48 @@ int WINAPI CaptionTextHandler::MyDrawTextW(
 				)
 			);
 		}
+		else
+		{
+			THROW_HR_IF_NULL(E_FAIL, hTheme);
+			result = g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
+		}
+	}
+	else
+	{
+		RECT textDrawRect{ *lprc };
+		textDrawRect.right += GetLegacyTextSurfacePadding();
+		if (DrawGdiSubpixelText(hdc, lpchText, cchText, textDrawRect, format, options.crText))
+		{
+			RECT calcRect{ *lprc };
+			result = g_DrawTextW_Org(hdc, lpchText, cchText, &calcRect, format | DT_CALCRECT);
+		}
+		else
+		{
+		wil::unique_htheme hTheme{ OpenThemeData(nullptr, L"CompositedWindow::Window") };
+		if (hTheme)
+		{
+			THROW_IF_FAILED(
+				DrawThemeTextEx(
+					hTheme.get(),
+					hdc,
+					0,
+					0,
+					lpchText,
+					cchText,
+					format,
+					lprc,
+					&options
+				)
+			);
+		}
+		else
+		{
+			THROW_HR_IF_NULL(E_FAIL, hTheme);
+			result = g_DrawTextW_Org(hdc, lpchText, cchText, lprc, format);
+		}
+	}
 	}
 
-	result = DrawCaptionTextDirectWrite(
-		hdc,
-		lpchText,
-		cchText,
-		lprc,
-		format,
-		textColorOverride
-	);
-
-	// Caption text is rasterized into a widened monochrome mask and then filtered into per-channel
-	// coverage before compositing, mirroring the Windows 7 mask-first ClearType pipeline.
 	// override that so we can use the correct param in CDrawImageInstruction::Create
 	lprc->left -= GetLegacyTextSurfacePadding();
 	lprc->top -= GetLegacyTextSurfacePadding();
@@ -833,12 +1259,251 @@ void CaptionTextHandler::MyID2D1DeviceContext_DrawTextLayout(
 	});
 
 	const auto& windowState = g_textVisualStateMap[g_dwriteTextVisual];
-	const auto textColorOverride = GetResolvedCaptionTextColor(windowState, 0xFFFFFFFF);
+	const auto textColorOverride = windowState.active ? (windowState.maximized ? g_captionActiveColorMaximized : g_captionActiveColor) : (windowState.maximized ? g_captionInactiveColorMaximized : g_captionInactiveColor);
 	if (textColorOverride != 0xFFFFFFFF)
 	{
 		solidColorBrush->SetColor(Color::FromAbgr(textColorOverride));
 	}
-	ApplyCaptionTextEllipsis(textLayout);
+
+	if (!g_textGlowSize)
+	{
+		if (SUCCEEDED(DrawSubpixelTextLayout(This, origin, textLayout, solidColorBrush->GetColor())))
+		{
+			return;
+		}
+
+		return g_ID2D1DeviceContext_DrawTextLayout_Org(
+			This,
+			origin,
+			textLayout,
+			defaultFillBrush,
+			options
+		);
+	}
+
+	origin.x += g_textGlowSize;
+	origin.y += g_textGlowSize;
+
+	DWRITE_TEXT_METRICS metrics{};
+	THROW_IF_FAILED(
+		textLayout->GetMetrics(
+			&metrics
+		)
+	);
+
+	if (!metrics.width || !metrics.height)
+	{
+		return g_ID2D1DeviceContext_DrawTextLayout_Org(
+			This,
+			origin,
+			textLayout,
+			defaultFillBrush,
+			options
+		);
+	}
+
+	if (LOWORD(Shared::g_textGlowMode) == 3 && g_textGlowIntensity)
+	{
+		winrt::com_ptr<ID2D1BitmapRenderTarget> bitmapRT{};
+		THROW_IF_FAILED(
+			This->CreateCompatibleRenderTarget(
+				D2D1::SizeF(
+					std::ceil(metrics.left + metrics.width) + static_cast<float>(g_textGlowSize * 2),
+					std::ceil(metrics.top + metrics.height) + static_cast<float>(g_textGlowSize * 2)
+				),
+				bitmapRT.put()
+			)
+		);
+
+		bitmapRT->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+		bitmapRT->BeginDraw();
+		bitmapRT->Clear();
+		bitmapRT->DrawTextLayout(
+			D2D1::Point2F(),
+			textLayout,
+			defaultFillBrush,
+			options
+		);
+		THROW_IF_FAILED(bitmapRT->EndDraw());
+
+		winrt::com_ptr<ID2D1Bitmap> bitmap{};
+		THROW_IF_FAILED(bitmapRT->GetBitmap(bitmap.put()));
+
+		if (!g_textMorphologyEffect)
+		{
+			THROW_IF_FAILED(
+				This->CreateEffect(
+					CLSID_D2D1Morphology,
+					g_textMorphologyEffect.put()
+				)
+			);
+			THROW_IF_FAILED(
+				g_textMorphologyEffect->SetValue(
+					D2D1_MORPHOLOGY_PROP_MODE,
+					D2D1_MORPHOLOGY_MODE_DILATE
+				)
+			);
+			THROW_IF_FAILED(
+				g_textMorphologyEffect->SetValue(
+					D2D1_MORPHOLOGY_PROP_WIDTH,
+					3 + g_textGlowSize / 12
+				)
+			);
+			THROW_IF_FAILED(
+				g_textMorphologyEffect->SetValue(
+					D2D1_MORPHOLOGY_PROP_HEIGHT,
+					3 + g_textGlowSize / 12
+				)
+			);
+		}
+		if (!g_textGlowEffect)
+		{
+			THROW_IF_FAILED(
+				This->CreateEffect(
+					CLSID_D2D1Shadow,
+					g_textGlowEffect.put()
+				)
+			);
+			THROW_IF_FAILED(
+				g_textGlowEffect->SetValue(
+					D2D1_SHADOW_PROP_OPTIMIZATION,
+					D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED
+				)
+			);
+			g_textGlowEffect->SetInputEffect(0, g_textMorphologyEffect.get());
+		}
+		THROW_IF_FAILED(
+			g_textGlowEffect->SetValue(
+				D2D1_SHADOW_PROP_COLOR,
+				Color::FromAbgr(g_textGlowColor | (std::min(g_textGlowIntensity, 255) << 24), false)
+			)
+		);
+		THROW_IF_FAILED(
+			g_textGlowEffect->SetValue(
+				D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
+				std::max(
+					0.f,
+					(static_cast<float>(g_textGlowSize)) / 3.f + 0.5f
+				)
+			)
+		);
+		g_textMorphologyEffect->SetInput(0, bitmap.get());
+
+		This->DrawImage(
+			g_textGlowEffect.get(),
+			&origin,
+			nullptr,
+			D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+			D2D1_COMPOSITE_MODE_SOURCE_COPY
+		);
+		if (SUCCEEDED(DrawSubpixelTextLayout(This, origin, textLayout, solidColorBrush->GetColor())))
+		{
+			return;
+		}
+
+		return g_ID2D1DeviceContext_DrawTextLayout_Org(
+			This,
+			origin,
+			textLayout,
+			defaultFillBrush,
+			options
+		);
+	}
+	if (LOWORD(Shared::g_textGlowMode) == 1 || LOWORD(Shared::g_textGlowMode) == 2)
+	{
+		if (!g_textGlowD2DBitmap)
+		{
+			THROW_IF_FAILED(
+				This->CreateBitmap(
+					D2D1::SizeU(
+						Shared::g_textGlowBitmapInfo.bmiHeader.biWidth,
+						-Shared::g_textGlowBitmapInfo.bmiHeader.biHeight
+					),
+					Shared::g_textGlowBitmapPixels,
+					Shared::g_textGlowBitmapInfo.bmiHeader.biWidth * 4,
+					D2D1::BitmapProperties1(
+						D2D1_BITMAP_OPTIONS_NONE,
+						D2D1::PixelFormat(
+							DXGI_FORMAT_B8G8R8A8_UNORM,
+							D2D1_ALPHA_MODE_PREMULTIPLIED
+						)
+					),
+					g_textGlowD2DBitmap.put()
+				)
+			);
+		}
+
+		DWRITE_OVERHANG_METRICS overhangs{};
+		THROW_IF_FAILED(
+			textLayout->GetOverhangMetrics(
+				&overhangs
+			)
+		);
+		const D2D1_RECT_F textBoundingBox
+		{
+			origin.x + (std::floor(-overhangs.left) - 1.f),
+			origin.y + std::floor(metrics.top) - 1.f,
+			origin.x + (std::floor(-overhangs.left) - 1.f) + g_textSizeF.Width,
+			origin.y + std::floor(metrics.top + metrics.height) + 1.f
+		};
+		D2D1_RECT_F glowRect
+		{
+			textBoundingBox.left - static_cast<float>(g_contentMargins.cxLeftWidth),
+			textBoundingBox.top - static_cast<float>(g_contentMargins.cyTopHeight),
+			textBoundingBox.right + static_cast<float>(g_contentMargins.cxRightWidth),
+			textBoundingBox.bottom + static_cast<float>(g_contentMargins.cyBottomHeight)
+		};
+
+		const auto calcGlowClipRect = [&windowState](const D2D1_RECT_F& textRect, D2D1_RECT_F& glowClipRect, bool mirrored)
+		{
+			LONG offset = 0;
+			offset += windowState.windowRectLeft;
+			offset -= g_dwriteTextVisual->GetX();
+			offset -= g_centerCaption ? static_cast<LONG>(std::round((static_cast<float>(g_dwriteTextVisual->GetWidth()) - g_textSizeF.Width) / 2.f)) : 0l;
+			if (!mirrored)
+			{
+				glowClipRect.left = std::max(
+					glowClipRect.left,
+					textRect.left +
+					offset
+				);
+			}
+			else
+			{
+				glowClipRect.right = std::min(
+					glowClipRect.right,
+					textRect.right -
+					offset
+				);
+			}
+		};
+		calcGlowClipRect(textBoundingBox, glowRect, g_dwriteTextVisual->IsRTLMirrored());
+
+		THROW_IF_FAILED(
+			Util::DrawNineGridBitmap(
+				This,
+				g_textGlowD2DBitmap.get(),
+				glowRect,
+				g_sizingMargins,
+				LOWORD(Shared::g_textGlowMode) == 2 ? (windowState.active ? (windowState.maximized ? Shared::g_glowOpacityMaximized : Shared::g_glowOpacity) : (windowState.maximized ? Shared::g_glowOpacityInactiveMaximized : Shared::g_glowOpacityInactive)) : 1.f
+			)
+		);
+		/*{
+			winrt::com_ptr<ID2D1SolidColorBrush> brush{};
+			THROW_IF_FAILED(This->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Red), brush.put()));
+			This->DrawRectangle(
+				glowRect,
+				brush.get(),
+				1.f,
+				nullptr
+			);
+		}*/
+	}
+
+	if (SUCCEEDED(DrawSubpixelTextLayout(This, origin, textLayout, solidColorBrush->GetColor())))
+	{
+		return;
+	}
 
 	return g_ID2D1DeviceContext_DrawTextLayout_Org(
 		This,
@@ -847,7 +1512,7 @@ void CaptionTextHandler::MyID2D1DeviceContext_DrawTextLayout(
 		defaultFillBrush,
 		options
 	);
-	}
+}
 
 HRESULT CaptionTextHandler::MyICompositionGraphicsDevice_CreateDrawingSurface(
 	abi::ICompositionGraphicsDevice* This,
@@ -915,41 +1580,74 @@ HRESULT CaptionTextHandler::MyICompositionSurfaceBrush2_put_Offset(
 }
 
 HRESULT CaptionTextHandler::MyCDWriteText_ValidateVisual(uDWM::CDWriteText* This)
+{
+	// 0x2 redraw text
+	// 0x8 offset changed
+	// 0x10 rtl mirrored changed
+	if ((This->GetDirtyFlags() & (0x8 | 0x10)))
 	{
-		// 0x2 redraw text
-		// 0x8 offset changed
-		// 0x10 rtl mirrored changed
-		if ((This->GetDirtyFlags() & (0x8 | 0x10)))
-		{
-			This->SetDirtyFlags(0x2);
-		}
-		if ((This->GetDirtyFlags() & 0x2))
-		{
-			This->SetDirtyFlags(0x8);
-		}
-		if (!g_CDWriteText_scalar_deleting_destructor_Org)
-		{
-			g_CDWriteText_scalar_deleting_destructor_Org_Address = HookHelper::get_vftable_from<decltype(g_CDWriteText_scalar_deleting_destructor_Org)>(This);
-			HookHelper::PatchPointerT(
-				g_CDWriteText_scalar_deleting_destructor_Org_Address,
-				MyCDWriteText_scalar_deleting_destructor,
-				&g_CDWriteText_scalar_deleting_destructor_Org
-			);
-		}
-		if (g_window = uDWM::TryGetWindowFromVisual(This); g_window && g_window->GetData())
-		{
-			auto& windowState = g_textVisualStateMap[This];
-
-			windowState.active = g_window->TreatAsActiveWindow();
-			windowState.maximized = g_window->TreatAsMaximized();
-		}
-		g_dwriteTextVisual = This;
-		const auto hr = g_CDWriteText_ValidateVisual_Org(This);
-		g_dwriteTextVisual = nullptr;
-		g_window = nullptr;
-
-		return hr;
+		This->SetDirtyFlags(0x2);
 	}
+	if ((This->GetDirtyFlags() & 0x2))
+	{
+		This->SetDirtyFlags(0x8);
+	}
+	if (!g_CDWriteText_scalar_deleting_destructor_Org)
+	{
+		g_CDWriteText_scalar_deleting_destructor_Org_Address = HookHelper::get_vftable_from<decltype(g_CDWriteText_scalar_deleting_destructor_Org)>(This);
+		HookHelper::PatchPointerT(
+			g_CDWriteText_scalar_deleting_destructor_Org_Address,
+			MyCDWriteText_scalar_deleting_destructor,
+			&g_CDWriteText_scalar_deleting_destructor_Org
+		);
+	}
+	if (!g_CDWriteText_UpdateOffset_Org)
+	{
+		PVOID CVisual_UpdateOffset_Org{ nullptr };
+		PVOID CSpriteVisual_SetSize_Org{ nullptr };
+		uDWM::g_projectionArray.ApplyToVariable("CVisual::UpdateOffset", CVisual_UpdateOffset_Org);
+		uDWM::g_projectionArray.ApplyToVariable("CSpriteVisual::SetSize", CSpriteVisual_SetSize_Org);
+
+		for (auto& vf : std::span{ HookHelper::get_vftable_from(This), 32})
+		{
+			if (vf == CVisual_UpdateOffset_Org)
+			{
+				g_CDWriteText_UpdateOffset_Org_Address = reinterpret_cast<decltype(g_CDWriteText_UpdateOffset_Org_Address)>(&vf);
+				HookHelper::PatchPointerT(
+					g_CDWriteText_UpdateOffset_Org_Address,
+					MyCDWriteText_UpdateOffset,
+					&g_CDWriteText_UpdateOffset_Org
+				);
+			}
+			if (vf == CSpriteVisual_SetSize_Org)
+			{
+				g_CDWriteText_SetSize_Org_Address = reinterpret_cast<decltype(g_CDWriteText_SetSize_Org_Address)>(&vf);
+				HookHelper::PatchPointerT(
+					g_CDWriteText_SetSize_Org_Address,
+					MyCDWriteText_SetSize,
+					&g_CDWriteText_SetSize_Org
+				);
+			}
+		}
+	}
+	if (g_window = uDWM::TryGetWindowFromVisual(This); g_window && g_window->GetData())
+	{
+		auto& windowState = g_textVisualStateMap[This];
+
+		windowState.active = g_window->TreatAsActiveWindow();
+		windowState.maximized = g_window->TreatAsMaximized();
+
+		RECT windowRect{};
+		g_window->GetActualWindowRect(&windowRect, true, false, true);
+		windowState.windowRectLeft = windowRect.left;
+	}
+	g_dwriteTextVisual = This;
+	const auto hr = g_CDWriteText_ValidateVisual_Org(This);
+	g_dwriteTextVisual = nullptr;
+	g_window = nullptr;
+
+	return hr;
+}
 
 HRESULT CaptionTextHandler::MyCDWriteText_UpdateOffset(uDWM::CDWriteText* This)
 {
@@ -1018,11 +1716,12 @@ HRESULT CaptionTextHandler::MyCDWriteText_scalar_deleting_destructor(uDWM::CDWri
 
 void CaptionTextHandler::CalculateRealizedTextGlowParams(int textGlowMode)
 {
-	if (textGlowMode == 0)
+	const auto glowMode = LOWORD(textGlowMode);
+	if (glowMode == 0)
 	{
 		g_textGlowSize = 0;
 	}
-	else if (textGlowMode == 1 || textGlowMode == 2)
+	else if (glowMode == 1 || glowMode == 2)
 	{
 		const auto themeHandle = CustomThemeAtlasLoader::GetThemeHandle();
 
@@ -1074,7 +1773,6 @@ void CaptionTextHandler::DestroyDeviceResources()
 {
 	g_textGlowRT = nullptr;
 	g_textGlowD2DBitmap = nullptr;
-	g_textBackgroundBrush = nullptr;
 
 	if (uDWM::g_versionInfo.build < os::build_w11_22h2)
 	{
@@ -1094,6 +1792,7 @@ void CaptionTextHandler::Update(GlassEngine::UpdateType type)
 	if (type & GlassEngine::UpdateType::Backdrop || type & GlassEngine::UpdateType::Theme)
 	{
 		g_centerCaption = static_cast<bool>(GlassEngine::GetDwordFromRegistry(L"CenterCaption", FALSE));
+		g_captionSubpixelTextRenderer = static_cast<bool>(GlassEngine::GetDwordFromRegistry(L"CaptionSubpixelTextRenderer", TRUE));
 		g_captionActiveColor = GlassEngine::GetDwordFromRegistry(L"ColorizationColorCaption", 0xFFFFFFFD);
 		g_captionInactiveColor = GlassEngine::GetDwordFromRegistry(L"ColorizationColorCaptionInactive", g_captionActiveColor);
 		g_captionActiveColorMaximized = GlassEngine::GetDwordFromRegistry(L"ColorizationColorCaptionMaximized", g_captionActiveColor);
