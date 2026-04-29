@@ -147,6 +147,30 @@ namespace OpenGlass::CaptionTextHandler
 	{
 		return g_textGlowSize + c_gdiTextPadding;
 	}
+	bool IsFontSmoothingEnabled()
+	{
+		BOOL enabled{ TRUE };
+		if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &enabled, 0))
+		{
+			return true;
+		}
+
+		return enabled != FALSE;
+	}
+	bool IsClearTypeEnabled()
+	{
+		BOOL enabled{ TRUE };
+		if (!SystemParametersInfoW(SPI_GETCLEARTYPE, 0, &enabled, 0))
+		{
+			return true;
+		}
+
+		return enabled != FALSE;
+	}
+	bool IsCaptionSubpixelTextRendererEnabled()
+	{
+		return g_captionSubpixelTextRenderer && IsFontSmoothingEnabled() && IsClearTypeEnabled();
+	}
 	class CaptionSubpixelTextRenderer final : public IDWriteTextRenderer
 	{
 		static constexpr int c_subpixelScale = c_captionSubpixelScale;
@@ -470,6 +494,11 @@ namespace OpenGlass::CaptionTextHandler
 		D2D1_COLOR_F color
 	)
 	{
+		if (!IsCaptionSubpixelTextRendererEnabled())
+		{
+			return S_FALSE;
+		}
+
 		RETURN_HR_IF_NULL(E_INVALIDARG, context);
 		RETURN_HR_IF_NULL(E_INVALIDARG, textLayout);
 
@@ -567,7 +596,7 @@ bool CaptionTextHandler::DrawGdiSubpixelText(
 	COLORREF color
 )
 {
-	if (!g_captionSubpixelTextRenderer)
+	if (!IsCaptionSubpixelTextRendererEnabled())
 	{
 		return false;
 	}
@@ -795,7 +824,7 @@ bool CaptionTextHandler::MeasureGdiSubpixelText(
 	UINT format
 )
 {
-	if (!g_captionSubpixelTextRenderer || !rect)
+	if (!IsCaptionSubpixelTextRendererEnabled() || !rect)
 	{
 		return false;
 	}
